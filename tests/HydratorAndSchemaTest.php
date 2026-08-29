@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Summae\Laravel\Tests;
 
 use Summae\Core\Substrate\Side;
+use Summae\Core\Substrate\Currency;
 use Summae\Laravel\Repository\Hydrator;
 use Summae\Laravel\Schema\SchemaInstaller;
 
@@ -21,11 +22,11 @@ final class HydratorAndSchemaTest extends AdapterTestCase
 {
     public function testMoneyFallsBackToTheDocumentedDefaultsRatherThanCrashing(): void
     {
-        self::assertSame('12.34', Hydrator::money(['amount' => '12.34', 'currency' => 'EUR'])->amountAsString());
+        self::assertSame('12.34', Hydrator::money(['amount' => '12.34', 'currency' => 'EUR'], Currency::of('EUR'))->amountAsString());
 
         // A malformed document must not take the process down mid-read; zero EUR is the documented
         // fallback, and the amount is still validated by Money itself.
-        $fallback = Hydrator::money([]);
+        $fallback = Hydrator::money([], Currency::of('EUR'));
         self::assertSame('0.00', $fallback->amountAsString());
         self::assertSame('EUR', $fallback->currency->code);
     }
@@ -51,7 +52,7 @@ final class HydratorAndSchemaTest extends AdapterTestCase
                 'side' => 'debit',
                 'money' => ['amount' => '100.00', 'currency' => 'EUR'],
             ],
-        ]);
+        ], Currency::of('EUR'));
 
         self::assertCount(2, $lines);
         self::assertSame(Side::Credit, $lines[0]->side);
@@ -113,6 +114,38 @@ final class HydratorAndSchemaTest extends AdapterTestCase
         // drop is idempotent — a second run must not blow up on tables that are already gone.
         SchemaInstaller::drop($builder);
         self::assertFalse($builder->hasTable(SchemaInstaller::PREFIX . 'accounts'));
+    }
+
+    public function testAnExistingTableGainsANullableColumnInsteadOfBreakingOnTheNextInsert(): void
+    {
+        // The upgrade path, simulated the only way it can be: drop the table and recreate it in the
+        // shape it had BEFORE the validity window existed, then run the installer again. `ensure`
+        // alone would have left it exactly as it is here and the next `add()` would have failed on
+        // an unknown column — which is what "by hand" meant in practice.
+        $builder = $this->schema();
+        $table = SchemaInstaller::PREFIX . 'accounts';
+
+        $builder->drop($table);
+        $builder->create($table, static function (\Illuminate\Database\Schema\Blueprint $blueprint): void {
+            $blueprint->uuid('id')->primary();
+            $blueprint->uuid('tenant_id')->index();
+            $blueprint->string('number', 64);
+            $blueprint->string('name');
+            $blueprint->string('type', 16);
+            $blueprint->string('subtype', 32)->nullable();
+            $blueprint->string('status', 16)->default('active');
+            $blueprint->unique(['tenant_id', 'number']);
+        });
+        self::assertFalse($builder->hasColumn($table, 'valid_from'), 'precondition: the old shape');
+
+        SchemaInstaller::create($builder);
+
+        self::assertTrue($builder->hasColumn($table, 'valid_from'));
+        self::assertTrue($builder->hasColumn($table, 'valid_to'));
+
+        // Idempotent: running it a third time must not try to add them again.
+        SchemaInstaller::create($builder);
+        self::assertTrue($builder->hasColumn($table, 'valid_to'));
     }
 
     public function testTheAccountNumberIsUniquePerTenantAndNotGlobally(): void
